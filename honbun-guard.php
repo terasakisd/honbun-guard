@@ -2,8 +2,8 @@
 /**
  * Plugin Name: 本文誤削除防止プラグイン
  * Plugin URI:  https://github.com/terasakisd/honbun-guard
- * Description: 公開済み・非公開の記事を保存したとき、本文の文字数が前回より大きく減っていたら保存をブロックします。
- * Version: 1.4.0
+ * Description: 公開済み・非公開の記事を保存したとき、本文の文字数が前回より大きく減っていたら保存をブロックします。見出しが減っていた場合は警告を表示します。
+ * Version: 1.5.0
  * Author: -
  * License: GPL-2.0-or-later
  * Text Domain: honbun-guard
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'HBG_VERSION', '1.4.0' );
+define( 'HBG_VERSION', '1.5.0' );
 define( 'HBG_PLUGIN_FILE', __FILE__ );
 
 class Honbun_Guard {
@@ -35,6 +35,9 @@ class Honbun_Guard {
 		// クラシックエディタ: 送信前チェック用のフィールドとスクリプト
 		add_action( 'edit_form_top', array( $instance, 'print_override_field' ) );
 		add_action( 'admin_footer', array( $instance, 'print_editor_script' ) );
+
+		// ブロックエディタ: 見出し減少の警告スクリプト
+		add_action( 'enqueue_block_editor_assets', array( $instance, 'enqueue_block_editor_script' ) );
 
 		// 管理画面
 		add_action( 'admin_menu', array( $instance, 'add_settings_page' ) );
@@ -61,6 +64,11 @@ class Honbun_Guard {
 		$text = wp_strip_all_tags( $text );
 		$text = preg_replace( '/\s+/u', '', $text ); // 空白・改行は数えない
 		return mb_strlen( $text );
+	}
+
+	/** 本文中の見出し（h1〜h6）の数 */
+	public function count_headings( $content ) {
+		return (int) preg_match_all( '/<h[1-6][\s>]/i', (string) $content );
 	}
 
 	/**
@@ -209,8 +217,8 @@ class Honbun_Guard {
 		printf( '<div class="notice notice-error is-dismissible"><p>%s</p></div>', $message );
 	}
 
-	/** 対象の編集画面かどうか（クラシックエディタの公開済み・非公開記事） */
-	private function is_guarded_classic_screen( $post ) {
+	/** ガード対象の投稿かどうか（公開済み・非公開の対象投稿タイプ） */
+	private function is_guarded_post( $post ) {
 		if ( ! $post || ! in_array( $post->post_status, array( 'publish', 'private' ), true ) ) {
 			return false;
 		}
@@ -222,7 +230,7 @@ class Honbun_Guard {
 
 	/** クラシックエディタのフォーム内に、許可フラグ用の隠しフィールドを出力 */
 	public function print_override_field( $post ) {
-		if ( ! $this->is_guarded_classic_screen( $post ) ) {
+		if ( ! $this->is_guarded_post( $post ) ) {
 			return;
 		}
 		wp_nonce_field( 'hbg_override', 'hbg_nonce' );
@@ -237,22 +245,23 @@ class Honbun_Guard {
 		}
 
 		global $post;
-		if ( ! $this->is_guarded_classic_screen( $post ) ) {
+		if ( ! $this->is_guarded_post( $post ) ) {
 			return;
 		}
 
 		$settings = $this->get_settings();
 		$config   = array(
-			'oldChars'  => $this->count_chars( $post->post_content ),
-			'threshold' => (float) $settings['threshold_percent'],
-			'minChars'  => (int) $settings['min_chars'],
+			'oldChars'    => $this->count_chars( $post->post_content ),
+			'oldHeadings' => $this->count_headings( $post->post_content ),
+			'threshold'   => (float) $settings['threshold_percent'],
+			'minChars'    => (int) $settings['min_chars'],
 		);
 		?>
 		<script>
 		( function() {
 			var cfg = <?php echo wp_json_encode( $config ); ?>;
 			var form = document.getElementById( 'post' );
-			if ( ! form || cfg.oldChars < cfg.minChars ) {
+			if ( ! form ) {
 				return;
 			}
 
@@ -264,6 +273,11 @@ class Honbun_Guard {
 				return Array.from( text ).length;
 			}
 
+			function countHeadings( html ) {
+				var m = String( html ).match( /<h[1-6][\s>]/gi );
+				return m ? m.length : 0;
+			}
+
 			function currentContent() {
 				if ( window.tinymce && tinymce.get( 'content' ) && ! tinymce.get( 'content' ).isHidden() ) {
 					return tinymce.get( 'content' ).getContent();
@@ -272,15 +286,14 @@ class Honbun_Guard {
 				return textarea ? textarea.value : '';
 			}
 
-			function showDialog( oldChars, newChars, dropPercent, onConfirm ) {
+			function showDialog( opts, onConfirm ) {
 				var overlay = document.createElement( 'div' );
 				overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100100;display:flex;align-items:center;justify-content:center;';
 				overlay.innerHTML =
 					'<div style="background:#fff;border-radius:4px;max-width:480px;width:90%;padding:24px;box-shadow:0 3px 30px rgba(0,0,0,.3);">' +
-						'<h2 style="margin:0 0 12px;font-size:16px;">本文の文字数が大きく減っています</h2>' +
-						'<p style="margin:0 0 16px;">本文が前回より <strong>' + dropPercent + '%</strong> 減っています' +
-						'（' + oldChars.toLocaleString() + '文字 → ' + newChars.toLocaleString() + '文字）。<br>誤って本文を消していないかご確認ください。</p>' +
-						'<label style="display:block;margin:0 0 20px;"><input type="checkbox" id="hbg-dialog-check"> 本文の削除は意図的なものです。このまま更新します。</label>' +
+						'<h2 style="margin:0 0 12px;font-size:16px;">' + opts.title + '</h2>' +
+						'<p style="margin:0 0 16px;">' + opts.body + '</p>' +
+						'<label style="display:block;margin:0 0 20px;"><input type="checkbox" id="hbg-dialog-check"> ' + opts.checkLabel + '</label>' +
 						'<div style="text-align:right;">' +
 							'<button type="button" class="button" id="hbg-dialog-cancel">キャンセル</button> ' +
 							'<button type="button" class="button button-primary" id="hbg-dialog-ok" disabled>このまま更新</button>' +
@@ -313,9 +326,13 @@ class Honbun_Guard {
 					return;
 				}
 
-				var newChars = countChars( currentContent() );
-				var drop = ( cfg.oldChars - newChars ) / cfg.oldChars * 100;
-				if ( drop < cfg.threshold ) {
+				var content        = currentContent();
+				var newChars       = countChars( content );
+				var newHeadings    = countHeadings( content );
+				var charDrop       = cfg.oldChars > 0 ? ( cfg.oldChars - newChars ) / cfg.oldChars * 100 : 0;
+				var charTrigger    = cfg.oldChars >= cfg.minChars && charDrop >= cfg.threshold;
+				var headingTrigger = newHeadings < cfg.oldHeadings;
+				if ( ! charTrigger && ! headingTrigger ) {
 					return;
 				}
 
@@ -333,7 +350,30 @@ class Honbun_Guard {
 					jQuery( '#publishing-action .spinner' ).removeClass( 'is-active' );
 				}
 
-				showDialog( cfg.oldChars, newChars, Math.round( drop * 10 ) / 10, function() {
+				var headingNote = headingTrigger
+					? '見出しも前回より減っています（' + cfg.oldHeadings + '個 → ' + newHeadings + '個）。<br>'
+					: '';
+				var opts;
+				if ( charTrigger ) {
+					// 文字数の大幅減少: サーバー側でもブロックされる（チェックで上書き可）
+					opts = {
+						title: '本文の文字数が大きく減っています',
+						body: '本文が前回より <strong>' + ( Math.round( charDrop * 10 ) / 10 ) + '%</strong> 減っています' +
+							'（' + cfg.oldChars.toLocaleString() + '文字 → ' + newChars.toLocaleString() + '文字）。<br>' +
+							headingNote + '誤って本文を消していないかご確認ください。',
+						checkLabel: '本文の削除は意図的なものです。このまま更新します。'
+					};
+				} else {
+					// 見出しの減少のみ: 警告（確認すればそのまま保存）
+					opts = {
+						title: '見出しが減っています',
+						body: '本文内の見出しが前回より減っています' +
+							'（' + cfg.oldHeadings + '個 → ' + newHeadings + '個）。<br>誤って見出しを消していないかご確認ください。',
+						checkLabel: '見出しの削除は意図的なものです。このまま更新します。'
+					};
+				}
+
+				showDialog( opts, function() {
 					var override = document.getElementById( 'hbg_override' );
 					if ( override ) {
 						override.value = '1';
@@ -354,6 +394,65 @@ class Honbun_Guard {
 		} )();
 		</script>
 		<?php
+	}
+
+	/**
+	 * ブロックエディタ: 保存時に見出し（h1〜h6）が前回より減っていたら警告を表示する。
+	 * 保存自体はブロックしない（文字数の大幅減少は check_rest_save がブロックする）。
+	 */
+	public function enqueue_block_editor_script() {
+		global $post;
+		if ( ! $this->is_guarded_post( $post ) ) {
+			return;
+		}
+
+		wp_register_script( 'hbg-block-editor', false, array( 'wp-data', 'wp-notices', 'wp-edit-post' ), HBG_VERSION, true );
+		wp_enqueue_script( 'hbg-block-editor' );
+
+		wp_add_inline_script(
+			'hbg-block-editor',
+			'window.hbgEditorCfg = ' . wp_json_encode( array( 'oldHeadings' => $this->count_headings( $post->post_content ) ) ) . ';'
+		);
+
+		$js = <<<'JS'
+( function() {
+	var baseline  = window.hbgEditorCfg ? window.hbgEditorCfg.oldHeadings : 0;
+	var NOTICE_ID = 'hbg-heading-warning';
+
+	function countHeadings( html ) {
+		var m = String( html || '' ).match( /<h[1-6][\s>]/gi );
+		return m ? m.length : 0;
+	}
+
+	var wasSaving = false;
+	wp.data.subscribe( function() {
+		var editor = wp.data.select( 'core/editor' );
+		if ( ! editor ) {
+			return;
+		}
+		var isSaving = editor.isSavingPost() && ! editor.isAutosavingPost();
+
+		// 保存開始時に見出し数をチェック（保存はブロックしない）
+		if ( isSaving && ! wasSaving ) {
+			var count = countHeadings( editor.getEditedPostContent() );
+			if ( count < baseline ) {
+				wp.data.dispatch( 'core/notices' ).createWarningNotice(
+					'【本文誤削除防止プラグイン】見出しが前回より減っています（' + baseline + '個 → ' + count + '個）。誤って見出しを消していないかご確認ください。',
+					{ id: NOTICE_ID }
+				);
+			}
+		}
+
+		// 保存が成功したら基準値を更新（意図的な削減に対して同じ警告を繰り返さない）
+		if ( ! isSaving && wasSaving && editor.didPostSaveRequestSucceed && editor.didPostSaveRequestSucceed() ) {
+			baseline = countHeadings( editor.getEditedPostContent() );
+		}
+
+		wasSaving = isSaving;
+	} );
+} )();
+JS;
+		wp_add_inline_script( 'hbg-block-editor', $js );
 	}
 
 	/* ---------------- 設定画面 ---------------- */
@@ -389,7 +488,7 @@ class Honbun_Guard {
 		?>
 		<div class="wrap">
 			<h1>本文誤削除防止プラグイン設定</h1>
-			<p>公開済み・非公開の記事・固定ページを保存したとき、本文の文字数（タグ・空白を除く）が前回より大きく減っていた場合は保存をブロックします。</p>
+			<p>公開済み・非公開の記事・固定ページを保存したとき、本文の文字数（タグ・空白を除く）が前回より大きく減っていた場合は保存をブロックします。また、見出し（h1〜h6）が前回より減っていた場合は警告を表示します（保存はブロックしません）。</p>
 			<form method="post" action="options.php">
 				<?php settings_fields( 'hbg_settings_group' ); ?>
 				<table class="form-table" role="presentation">
